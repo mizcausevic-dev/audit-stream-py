@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "audit-stream"
+version = "0.1.0"
+description = "Append-only governance event stream. Hash-chained for tamper-evidence, SSE for live tailing, REST for queries. The cross-cutting telemetry layer for the Kinetic Gain portfolio."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Miz Causevic", email = "miz@kineticgain.com" },
+]
+keywords = ["audit", "event-stream", "governance", "fastapi", "sse", "kinetic-gain"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.7",
+    "sse-starlette>=2.1",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.27",
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+audit-stream = "audit_stream.__main__:main"
+
+[project.urls]
+Homepage      = "https://github.com/mizcausevic-dev/audit-stream-py"
+Repository    = "https://github.com/mizcausevic-dev/audit-stream-py"
+Issues        = "https://github.com/mizcausevic-dev/audit-stream-py/issues"
+"Author Site" = "https://kineticgain.com/"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/audit_stream"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning:starlette.*",
+    "ignore::DeprecationWarning:fastapi.*",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+disallow_untyped_defs = true
+warn_unused_ignores = true
+no_implicit_optional = true
