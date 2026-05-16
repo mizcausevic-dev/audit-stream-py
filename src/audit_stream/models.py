@@ -34,6 +34,10 @@ EventKind = Literal[
     # feature-flag-rs / request-shadow-rs
     "flag_swapped",
     "shadow_divergence_recorded",
+    # mcp-permission-broker
+    "tool_invocation_allowed",
+    "tool_invocation_denied",
+    "tool_invocation_required_approval",
     # generic / extension hook
     "other",
 ]

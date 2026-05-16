@@ -75,6 +75,7 @@ Across the portfolio, "something governance-shaped happened" is the recurring ev
 | `incident-correlation-rs` | `incident_filed`, `remediation_planned` |
 | `hash-attestation-rs` | `attestation_verified`, `attestation_tampered` |
 | `feature-flag-rs` / `request-shadow-rs` | `flag_swapped`, `shadow_divergence_recorded` |
+| `mcp-permission-broker` | `tool_invocation_allowed`, `tool_invocation_denied`, `tool_invocation_required_approval` |
 | extension | `other` |
 
 Adding kinds is a Literal-only change; producers and verifiers stay backwards-compatible if you keep the canonical-hash construction stable.
