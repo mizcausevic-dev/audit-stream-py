@@ -15,6 +15,7 @@ EventKind = Literal[
     "decision_card_status_changed",
     # policy-as-code-engine
     "policy_bundle_registered",
+    "policy_condition_asserted",
     "request_denied",
     "request_allowed",
     # data-contract-registry
@@ -63,8 +64,9 @@ class GovernanceEvent(StrictModel):
       - `hash` is the SHA-256 of this event's serialised body (the canonical
         JSON of all fields except `hash`).
 
-    Verifiers re-compute the chain top-to-bottom and detect any altered
-    field, deleted event, or insertion.
+    Verifiers re-compute the chain top-to-bottom and detect altered fields,
+    interior deletion, or insertion within the chain still present. Tail
+    truncation and wholesale replacement need an external trusted checkpoint.
     """
 
     event_id: int = Field(..., ge=1)

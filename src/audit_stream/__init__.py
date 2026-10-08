@@ -1,7 +1,7 @@
 """
-audit-stream — append-only governance event stream for the Kinetic Gain portfolio.
+audit-stream — local, in-memory governance event-stream prototype.
 
-The cross-cutting telemetry layer. Every portfolio repo can fire events here:
+The event envelope admits kinds planned for portfolio producers:
 
     procurement-decision-api  -> "decision_card_drafted"
     policy-as-code-engine     -> "policy_bundle_registered" / "request_denied"
@@ -15,14 +15,15 @@ The cross-cutting telemetry layer. Every portfolio repo can fire events here:
 Three surfaces:
 
     POST /events                 producer — append one event
-    GET  /events                 consumer — query by time / kind / source
+    GET  /events                 consumer — query by kind / source
     GET  /stream                 consumer — live tail via Server-Sent Events
 
-Tamper-evidence:
+Local chain consistency:
 
     Each event carries `prev_hash` = canonical hash of the previous event,
-    and `hash` = canonical hash of itself. Verifiers walk the chain and any
-    altered or missing event breaks the linkage.
+    and `hash` = canonical hash of itself. Verifiers walk the retained chain.
+    This does not prove durability, completeness, or integrity across restart
+    without a separately trusted checkpoint. Event routes require a token.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from __future__ import annotations
 from .models import EventKind, GovernanceEvent
 from .store import AuditStore, ChainVerificationResult
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "AuditStore",

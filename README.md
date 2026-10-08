@@ -4,7 +4,11 @@
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Append-only governance event stream for the Kinetic Gain portfolio.** Hash-chained for tamper-evidence, Server-Sent Events for live tailing, REST for queries. The cross-cutting telemetry layer every other portfolio repo can produce into.
+**Local prototype of a governance event stream for the Kinetic Gain portfolio.** It hash-chains events in one process, supports Server-Sent Events for live tailing, and exposes REST queries. It is not a durable audit record or a production trust boundary.
+
+**Release boundary:** event data routes require a configured `AUDIT_STREAM_TOKEN` bearer token of at least 32 visible ASCII characters, with no whitespace. An unset or invalid token returns HTTP 503 for those routes; a missing or incorrect bearer token returns HTTP 401. The shared token has no per-producer or tenant scope. Current producers in `procurement-decision-api`, `policy-as-code-engine`, `mcp-permission-broker`, and `azure-openai-governance-bridge` do not send this header and will not deliver events until coordinated producer updates are reviewed. No production integration is verified.
+
+Proposed producer relationships, not an observed integrated deployment:
 
 ```text
                                        ┌─────────────────────┐
@@ -25,9 +29,9 @@
 
 ## Why
 
-Across the portfolio, "something governance-shaped happened" is the recurring event: a Decision Card was drafted, a policy bundle denied a request, a data contract was promoted, a watch detected drift, an attestation failed. Each repo already logs these — but to its own logs, in its own shape, with its own retention.
+Across the portfolio, "something governance-shaped happened" is the recurring event: a Decision Card was drafted, a policy bundle denied a request, a data contract was promoted, a watch detected drift, an attestation failed. The related services have separate event shapes and retention behavior.
 
-`audit-stream` is the **shared event spine**. One schema, one chain, one SSE socket, one REST query interface. Operators see the whole portfolio's behavior in a single place; auditors get a tamper-evident record by construction.
+`audit-stream` demonstrates a shared event envelope, chain, SSE socket, and REST query interface. Its current in-memory store is suitable for local contract experiments. It does not preserve events through restart, replicate across workers, authenticate a producer's asserted `source`, or anchor a chain head outside the process.
 
 ---
 
@@ -35,14 +39,14 @@ Across the portfolio, "something governance-shaped happened" is the recurring ev
 
 | Method | Path | What it does |
 | --- | --- | --- |
-| GET | `/` | Service info + endpoint list. |
-| GET | `/healthz` | Liveness probe. |
-| POST | `/events` | Append one governance event. Returns the assigned `event_id`, `prev_hash`, and `hash`. |
-| GET | `/events?kind=&source=&limit=` | Query. Filters by `kind` or `source`; `limit` caps the most-recent N events. |
-| GET | `/events/{id}` | Fetch one event by id. |
-| GET | `/stream` | Live tail via Server-Sent Events. Receives events appended **after** subscription. |
-| GET | `/verify` | Walk the entire chain and report the first integrity break, if any. |
-| GET | `/stats` | `{ count, last_event_id, latest_hash }`. |
+| GET | `/` | Service info + endpoint list; public. |
+| GET | `/healthz` | Liveness probe; public, no event data. |
+| POST | `/events` | Append one governance event. Returns the assigned `event_id`, `prev_hash`, and `hash`. Bearer token required. |
+| GET | `/events?kind=&source=&limit=` | Query. Filters by `kind` or `source`; `limit` caps the most-recent N events. Bearer token required. |
+| GET | `/events/{id}` | Fetch one event by id. Bearer token required. |
+| GET | `/stream` | Live tail via Server-Sent Events. Receives events appended **after** subscription. Bearer token required. |
+| GET | `/verify` | Walk the current in-memory chain and report the first integrity break, if any. Bearer token required. |
+| GET | `/stats` | `{ count, last_event_id, latest_hash }`. Bearer token required. |
 
 ---
 
@@ -64,12 +68,12 @@ Across the portfolio, "something governance-shaped happened" is the recurring ev
 
 ---
 
-## Event kinds (v0.1)
+## Event kinds (v0.2)
 
 | Source repo | Kinds |
 | --- | --- |
 | `procurement-decision-api` | `decision_card_drafted`, `decision_card_signed`, `decision_card_status_changed` |
-| `policy-as-code-engine` | `policy_bundle_registered`, `request_allowed`, `request_denied` |
+| `policy-as-code-engine` | `policy_bundle_registered`, `policy_condition_asserted`, `request_allowed`, `request_denied` |
 | `data-contract-registry` | `contract_promoted`, `contract_deprecated`, `contract_compatibility_failed` |
 | `aeo-validator-service` | `watch_created`, `watch_drifted`, `watch_validity_flipped` |
 | `incident-correlation-rs` | `incident_filed`, `remediation_planned` |
@@ -95,7 +99,7 @@ Adding kinds is a Literal-only change; producers and verifiers stay backwards-co
 }
 ```
 
-Operators can wire a periodic verify into their on-call alerting; a `valid: false` result is one of the most useful red lights a governance stack can produce.
+This verifies only the chain still present in this process. A restart produces an empty chain that also reports `valid: true` with `checked: 0`. The service cannot detect total loss, tail truncation with a recomputed head, or replacement of the whole chain without a separately trusted checkpoint. Do not use this result as a production audit-completeness claim.
 
 ---
 
@@ -109,18 +113,20 @@ id: 42
 data: {"event_id":42,"timestamp":"2026-05-15T03:14:15+00:00", …}
 ```
 
-Tail it with `curl -N http://localhost:8093/stream`, or wire it into a dashboard (e.g. a `EventSource` in browser JS, or `httpx-sse` in Python).
+Tail it with `curl -N -H "Authorization: Bearer $AUDIT_STREAM_TOKEN" http://localhost:8093/stream` or an authenticated server-side SSE client. Browser `EventSource` cannot attach this bearer header directly; use a trusted server-side relay if a browser dashboard needs the stream. Do not place the token in a query string.
 
 ---
 
 ## Quick start
 
 ```bash
-pip install audit-stream
-audit-stream            # binds 0.0.0.0:8093
+python -m pip install -e .    # from this repository checkout
+# Configure AUDIT_STREAM_TOKEN from a local secret source before starting.
+audit-stream            # binds 127.0.0.1:8093 by default
 
 # in another shell
 curl -X POST http://localhost:8093/events \
+  -H "Authorization: Bearer $AUDIT_STREAM_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"kind":"decision_card_drafted","source":"procurement-decision-api","payload":{"decision_id":"DEC-001"}}'
 ```
@@ -129,7 +135,17 @@ curl -X POST http://localhost:8093/events \
 
 ## Composes with
 
-- **[procurement-decision-api](https://github.com/mizcausevic-dev/procurement-decision-api)** · **[policy-as-code-engine](https://github.com/mizcausevic-dev/policy-as-code-engine)** · **[data-contract-registry](https://github.com/mizcausevic-dev/data-contract-registry)** · **[aeo-validator-service](https://github.com/mizcausevic-dev/aeo-validator-service)** · **[incident-correlation-rs](https://github.com/mizcausevic-dev/incident-correlation-rs)** · **[hash-attestation-rs](https://github.com/mizcausevic-dev/hash-attestation-rs)** · **[feature-flag-rs](https://github.com/mizcausevic-dev/feature-flag-rs)** · **[request-shadow-rs](https://github.com/mizcausevic-dev/request-shadow-rs)** — any of these can `POST /events` to produce a record of their own governance moments.
+- **[procurement-decision-api](https://github.com/mizcausevic-dev/procurement-decision-api)** · **[policy-as-code-engine](https://github.com/mizcausevic-dev/policy-as-code-engine)** · **[data-contract-registry](https://github.com/mizcausevic-dev/data-contract-registry)** · **[aeo-validator-service](https://github.com/mizcausevic-dev/aeo-validator-service)** · **[incident-correlation-rs](https://github.com/mizcausevic-dev/incident-correlation-rs)** · **[hash-attestation-rs](https://github.com/mizcausevic-dev/hash-attestation-rs)** · **[feature-flag-rs](https://github.com/mizcausevic-dev/feature-flag-rs)** · **[request-shadow-rs](https://github.com/mizcausevic-dev/request-shadow-rs)** — producers can target `POST /events` after they implement the bearer header and pass contract tests. The current service does not verify any producer's identity from its `source` field.
+
+## Production gates
+
+- Replace the process-local list with a durable, append-only store and test restart, multi-worker ordering, backup restoration, retention, and deletion policy.
+- Anchor chain heads in an independently trusted location; otherwise a valid hash chain proves only internal consistency of the events still present.
+- Replace the single shared bearer token with authenticated producer and reader identities, scoped authorization, rotation, and tenant isolation. Keep event payloads free of secrets and unnecessary personal data; the service does not redact them.
+- Enforce request-body and event-size limits before FastAPI body parsing, plus producer rate limits and a server-trusted timestamp. The current route dependency protects stored data but does not establish an HTTP request-size boundary for unauthenticated traffic.
+- Update each producer to send an authenticated request, then test accepted and rejected events at the actual deployment boundary. Producer emissions remain optional and best effort, so they do not currently prove a complete audit trail.
+- Standardize `AUDIT_STREAM_URL`: `procurement-decision-api` and `policy-as-code-engine` append `/events` to a base URL; `mcp-permission-broker` and `azure-openai-governance-bridge` expect the full `/events` URL. One shared setting does not currently work for all four.
+- Restrict network access before hosting this service. The CLI defaults to loopback, but `HOST=0.0.0.0` or direct `uvicorn` invocation can expose the one-token prototype on a network.
 
 ---
 

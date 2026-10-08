@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "audit-stream"
-version = "0.1.0"
-description = "Append-only governance event stream. Hash-chained for tamper-evidence, SSE for live tailing, REST for queries. The cross-cutting telemetry layer for the Kinetic Gain portfolio."
+version = "0.2.0"
+description = "Local in-memory governance event-stream prototype with hash-chained events, SSE, and REST queries."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"

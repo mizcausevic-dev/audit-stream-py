@@ -7,12 +7,21 @@ Example: fire a few governance events at a running audit-stream service.
 
 from __future__ import annotations
 
+import os
+
 import httpx
 
 
 def main() -> None:
     base = "http://localhost:8093"
-    with httpx.Client(base_url=base, timeout=5.0) as client:
+    token = os.environ.get("AUDIT_STREAM_TOKEN", "")
+    if not token:
+        raise RuntimeError("AUDIT_STREAM_TOKEN must be configured")
+    with httpx.Client(
+        base_url=base,
+        timeout=5.0,
+        headers={"Authorization": f"Bearer {token}"},
+    ) as client:
         # decision-card-api fires when a card is drafted
         client.post(
             "/events",

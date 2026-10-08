@@ -1,5 +1,5 @@
 """
-FastAPI app — six endpoints.
+FastAPI app — event and local verification endpoints.
 
   GET  /                  service info + endpoint list
   GET  /healthz           liveness probe
@@ -14,11 +14,14 @@ FastAPI app — six endpoints.
 from __future__ import annotations
 
 import json
+import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from secrets import compare_digest
 from typing import Any, cast
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from sse_starlette.sse import EventSourceResponse
 
 from . import __version__
@@ -50,6 +53,26 @@ def _store() -> AuditStore:
     return cast(AuditStore, app.state.store)
 
 
+def _require_token(authorization: str | None = Header(default=None)) -> None:
+    """Keep event data closed until an operator configures a shared token."""
+    expected = os.environ.get("AUDIT_STREAM_TOKEN", "")
+    if re.fullmatch(r"[!-~]{32,}", expected) is None:
+        raise HTTPException(status_code=503, detail="audit access is not configured")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="bearer token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    provided = authorization[len("Bearer ") :]
+    if not provided.isascii() or not compare_digest(provided, expected):
+        raise HTTPException(
+            status_code=401,
+            detail="invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
 @app.get("/", tags=["meta"])
 async def root() -> dict[str, Any]:
     return {
@@ -76,12 +99,12 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/events", tags=["producer"], status_code=201)
+@app.post("/events", tags=["producer"], status_code=201, dependencies=[Depends(_require_token)])
 async def append_event(req: PublishRequest) -> GovernanceEvent:
     return await _store().append(req)
 
 
-@app.get("/events", tags=["consumer"])
+@app.get("/events", tags=["consumer"], dependencies=[Depends(_require_token)])
 async def query_events(
     kind: EventKind | None = None,
     source: str | None = None,
@@ -98,7 +121,7 @@ async def query_events(
     return events[-limit:]
 
 
-@app.get("/events/{event_id}", tags=["consumer"])
+@app.get("/events/{event_id}", tags=["consumer"], dependencies=[Depends(_require_token)])
 async def get_event(event_id: int) -> GovernanceEvent:
     event = await _store().get(event_id)
     if event is None:
@@ -106,7 +129,7 @@ async def get_event(event_id: int) -> GovernanceEvent:
     return event
 
 
-@app.get("/stream", tags=["consumer"])
+@app.get("/stream", tags=["consumer"], dependencies=[Depends(_require_token)])
 async def stream_events() -> EventSourceResponse:
     """Live tail of every event after the moment of subscription."""
 
@@ -121,7 +144,7 @@ async def stream_events() -> EventSourceResponse:
     return EventSourceResponse(generator())
 
 
-@app.get("/verify", tags=["consumer"])
+@app.get("/verify", tags=["consumer"], dependencies=[Depends(_require_token)])
 async def verify_chain() -> dict[str, Any]:
     result = await _store().verify_chain()
     return {
@@ -132,7 +155,7 @@ async def verify_chain() -> dict[str, Any]:
     }
 
 
-@app.get("/stats", tags=["consumer"])
+@app.get("/stats", tags=["consumer"], dependencies=[Depends(_require_token)])
 async def stats() -> dict[str, Any]:
     latest = await _store().latest()
     return {

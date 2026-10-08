@@ -9,10 +9,13 @@ from fastapi.testclient import TestClient
 
 from audit_stream.app import app
 
+TEST_TOKEN = "synthetic-test-token-0123456789abcdef"
+
 
 @pytest.fixture
-def client() -> TestClient:
-    with TestClient(app) as c:
+def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    monkeypatch.setenv("AUDIT_STREAM_TOKEN", TEST_TOKEN)
+    with TestClient(app, headers={"Authorization": f"Bearer {TEST_TOKEN}"}) as c:
         yield c
 
 
@@ -59,6 +62,70 @@ class TestProducer:
     def test_strict_extras_rejected(self, client: TestClient) -> None:
         r = client.post("/events", json={**_event(), "extra_field": True})
         assert r.status_code == 422
+
+    def test_policy_condition_asserted_kind_from_current_producer(self, client: TestClient) -> None:
+        r = client.post(
+            "/events",
+            json=_event(
+                kind="policy_condition_asserted",
+                payload={"bundle_id": "TEST-1", "condition_id": "synthetic-condition"},
+            ),
+        )
+        assert r.status_code == 201
+        assert r.json()["kind"] == "policy_condition_asserted"
+
+
+class TestAccessBoundary:
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("POST", "/events"),
+            ("GET", "/events"),
+            ("GET", "/events/1"),
+            ("GET", "/stream"),
+            ("GET", "/verify"),
+            ("GET", "/stats"),
+        ],
+    )
+    def test_protected_routes_reject_missing_token(self, client: TestClient, method: str, path: str) -> None:
+        response = client.request(
+            method, path, headers={"Authorization": ""}, json=_event() if method == "POST" else None
+        )
+        assert response.status_code == 401
+        assert response.headers["www-authenticate"] == "Bearer"
+
+    def test_wrong_token_rejected(self, client: TestClient) -> None:
+        assert client.get("/stats", headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+    def test_unconfigured_service_fails_closed(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("AUDIT_STREAM_TOKEN")
+        assert client.post("/events", json=_event()).status_code == 503
+        assert client.get("/events").status_code == 503
+        assert client.get("/healthz").json() == {"status": "ok"}
+
+    @pytest.mark.parametrize("configured", ["short", "has spaces" * 4, "é" * 32])
+    def test_weak_or_invalid_config_fails_closed(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, configured: str
+    ) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_TOKEN", configured)
+        assert client.get("/stats").status_code == 503
+
+    def test_restart_discards_entire_in_memory_chain(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_TOKEN", TEST_TOKEN)
+        headers = {"Authorization": f"Bearer {TEST_TOKEN}"}
+        with TestClient(app, headers=headers) as first:
+            assert first.post("/events", json=_event()).status_code == 201
+            assert first.get("/stats").json()["count"] == 1
+        with TestClient(app, headers=headers) as restarted:
+            assert restarted.get("/stats").json()["count"] == 0
+            assert restarted.get("/verify").json() == {
+                "valid": True,
+                "checked": 0,
+                "first_break_at": None,
+                "reason": None,
+            }
 
 
 class TestConsumer:
