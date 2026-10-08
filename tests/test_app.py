@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,6 +18,7 @@ TEST_TOKEN = "synthetic-test-token-0123456789abcdef"
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("AUDIT_STREAM_TOKEN", TEST_TOKEN)
+    monkeypatch.delenv("AUDIT_STREAM_DB_PATH", raising=False)
     with TestClient(app, headers={"Authorization": f"Bearer {TEST_TOKEN}"}) as c:
         yield c
 
@@ -63,6 +67,43 @@ class TestProducer:
         r = client.post("/events", json={**_event(), "extra_field": True})
         assert r.status_code == 422
 
+    @pytest.mark.parametrize("non_finite", ["NaN", "Infinity", "-Infinity"])
+    def test_nonfinite_payload_rejected_before_append(self, client: TestClient, non_finite: str) -> None:
+        content = (
+            '{"kind":"request_allowed","source":"synthetic-test","payload":{"value":' + non_finite + "}}"
+        )
+        response = client.post("/events", content=content, headers={"Content-Type": "application/json"})
+        assert response.status_code == 422
+        assert client.get("/stats").json()["count"] == 0
+
+    def test_oversized_payload_rejected_before_append(self, client: TestClient) -> None:
+        event = _event(payload={"value": "x" * (64 * 1024)})
+        response = client.post(
+            "/events", content=json.dumps(event), headers={"Content-Type": "application/json"}
+        )
+        assert response.status_code == 422
+        assert client.get("/stats").json()["count"] == 0
+
+    def test_long_source_and_timestamp_rejected(self, client: TestClient) -> None:
+        assert client.post("/events", json=_event(source="x" * 129)).status_code == 422
+        assert client.post("/events", json=_event(source="synthetic\nforged")).status_code == 422
+        assert client.post("/events", json=_event(source="synthetic\n")).status_code == 422
+        assert client.post("/events", json=_event(timestamp="x" * 65)).status_code == 422
+        assert client.get("/stats").json()["count"] == 0
+
+    def test_invalid_unicode_rejected_before_append(self, client: TestClient) -> None:
+        content = json.dumps(_event(payload={"value": "\ud800"}))
+        assert (
+            client.post("/events", content=content, headers={"Content-Type": "application/json"}).status_code
+            == 422
+        )
+        content = json.dumps(_event(timestamp="\ud800"))
+        assert (
+            client.post("/events", content=content, headers={"Content-Type": "application/json"}).status_code
+            == 422
+        )
+        assert client.get("/stats").json()["count"] == 0
+
     def test_policy_condition_asserted_kind_from_current_producer(self, client: TestClient) -> None:
         r = client.post(
             "/events",
@@ -85,6 +126,8 @@ class TestAccessBoundary:
             ("GET", "/stream"),
             ("GET", "/verify"),
             ("GET", "/stats"),
+            ("GET", "/checkpoint"),
+            ("POST", "/verify/checkpoint"),
         ],
     )
     def test_protected_routes_reject_missing_token(self, client: TestClient, method: str, path: str) -> None:
@@ -119,6 +162,7 @@ class TestAccessBoundary:
 
     def test_restart_discards_entire_in_memory_chain(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("AUDIT_STREAM_TOKEN", TEST_TOKEN)
+        monkeypatch.delenv("AUDIT_STREAM_DB_PATH", raising=False)
         headers = {"Authorization": f"Bearer {TEST_TOKEN}"}
         with TestClient(app, headers=headers) as first:
             assert first.post("/events", json=_event()).status_code == 201
@@ -131,6 +175,47 @@ class TestAccessBoundary:
                 "first_break_at": None,
                 "reason": None,
             }
+
+    def test_sqlite_restart_preserves_chain_and_checkpoint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_TOKEN", TEST_TOKEN)
+        monkeypatch.setenv("AUDIT_STREAM_DB_PATH", str(tmp_path / "events.sqlite3"))
+        headers = {"Authorization": f"Bearer {TEST_TOKEN}"}
+        with TestClient(app, headers=headers) as first:
+            assert first.post("/events", json=_event()).status_code == 201
+            checkpoint = first.get("/checkpoint").json()
+            assert checkpoint["event_id"] == 1
+        with TestClient(app, headers=headers) as restarted:
+            assert restarted.get("/stats").json()["count"] == 1
+            assert restarted.get("/verify").json()["valid"] is True
+            assert restarted.post("/verify/checkpoint", json=checkpoint).json()["valid"] is True
+
+    def test_truncated_valid_chain_fails_external_checkpoint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        db = tmp_path / "events.sqlite3"
+        monkeypatch.setenv("AUDIT_STREAM_TOKEN", TEST_TOKEN)
+        monkeypatch.setenv("AUDIT_STREAM_DB_PATH", str(db))
+        headers = {"Authorization": f"Bearer {TEST_TOKEN}"}
+        with TestClient(app, headers=headers) as first:
+            assert first.post("/events", json=_event()).status_code == 201
+            assert first.post("/events", json=_event(kind="request_denied")).status_code == 201
+            checkpoint = first.get("/checkpoint").json()
+
+        connection = sqlite3.connect(db)
+        try:
+            connection.execute("DROP TRIGGER events_no_delete")
+            connection.execute("DELETE FROM events WHERE event_id=2")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with TestClient(app, headers=headers) as reopened:
+            assert reopened.get("/verify").json()["valid"] is True
+            response = reopened.post("/verify/checkpoint", json=checkpoint).json()
+            assert response["valid"] is False
+            assert response["reason"] == "checkpoint event is missing"
 
 
 class TestConsumer:
@@ -196,3 +281,17 @@ class TestVerifyAndStats:
         assert r["count"] == 2
         assert r["last_event_id"] == 2
         assert len(r["latest_hash"]) == 64
+
+    def test_checkpoint_requires_event_and_detects_wrong_or_missing_anchor(self, client: TestClient) -> None:
+        assert client.get("/checkpoint").status_code == 404
+        client.post("/events", json=_event())
+        checkpoint = client.get("/checkpoint").json()
+        assert client.post("/verify/checkpoint", json=checkpoint).json()["valid"] is True
+        wrong = {**checkpoint, "hash": "f" * 64}
+        result = client.post("/verify/checkpoint", json=wrong).json()
+        assert result["valid"] is False
+        assert result["reason"] == "checkpoint hash mismatch"
+        missing = {**checkpoint, "event_id": 2}
+        result = client.post("/verify/checkpoint", json=missing).json()
+        assert result["valid"] is False
+        assert result["reason"] == "checkpoint event is missing"

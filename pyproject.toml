@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "audit-stream"
 version = "0.2.0"
-description = "Local in-memory governance event-stream prototype with hash-chained events, SSE, and REST queries."
+description = "Local governance event-stream prototype with optional SQLite persistence, hash-chained events, SSE, and REST queries."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"

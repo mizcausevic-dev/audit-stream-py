@@ -9,6 +9,8 @@ FastAPI app — event and local verification endpoints.
   GET  /stream            live tail via Server-Sent Events
   GET  /verify            verify the hash chain end-to-end
   GET  /stats             { count, last_event_id, latest_hash }
+  GET  /checkpoint        export current head for external custody
+  POST /verify/checkpoint compare against an externally kept head
 """
 
 from __future__ import annotations
@@ -18,20 +20,26 @@ import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from secrets import compare_digest
 from typing import Any, cast
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from . import __version__
-from .models import EventKind, GovernanceEvent, PublishRequest
+from .models import Checkpoint, EventKind, GovernanceEvent, PublishRequest
+from .sqlite_store import SqliteAuditStore
 from .store import AuditStore
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    app.state.store = AuditStore()
+    db_path = os.environ.get("AUDIT_STREAM_DB_PATH", "").strip()
+    app.state.store = SqliteAuditStore(Path(db_path)) if db_path else AuditStore()
     try:
         yield
     finally:
@@ -47,6 +55,16 @@ app = FastAPI(
     ),
     lifespan=_lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, error: RequestValidationError) -> Response:
+    # FastAPI's default error body includes rejected input. NaN/Infinity in a
+    # payload can make that response itself fail JSON serialization, and audit
+    # payloads may contain data that should not be echoed to callers.
+    if request.method == "POST" and request.url.path == "/events":
+        return JSONResponse(status_code=422, content={"detail": "invalid event"})
+    return await request_validation_exception_handler(request, error)
 
 
 def _store() -> AuditStore:
@@ -90,6 +108,8 @@ async def root() -> dict[str, Any]:
             "GET  /stream": "live tail via Server-Sent Events",
             "GET  /verify": "verify the hash chain end-to-end",
             "GET  /stats": "summary stats",
+            "GET  /checkpoint": "export current chain head for external anchoring",
+            "POST /verify/checkpoint": "compare chain against an external checkpoint",
         },
     }
 
@@ -163,3 +183,26 @@ async def stats() -> dict[str, Any]:
         "last_event_id": latest.event_id if latest else 0,
         "latest_hash": latest.hash if latest else None,
     }
+
+
+@app.get("/checkpoint", tags=["consumer"], dependencies=[Depends(_require_token)])
+async def export_checkpoint() -> Checkpoint:
+    """Return a candidate anchor; the operator must store it independently."""
+    latest = await _store().latest()
+    if latest is None:
+        raise HTTPException(status_code=404, detail="no event to checkpoint")
+    return Checkpoint(event_id=latest.event_id, hash=latest.hash)
+
+
+@app.post("/verify/checkpoint", tags=["consumer"], dependencies=[Depends(_require_token)])
+async def verify_checkpoint(checkpoint: Checkpoint) -> dict[str, Any]:
+    """Compare the current chain with an operator-supplied trusted anchor."""
+    chain = await _store().verify_chain()
+    if not chain.valid:
+        return {"valid": False, "checked": chain.checked, "reason": chain.reason}
+    event = await _store().get(checkpoint.event_id)
+    if event is None:
+        return {"valid": False, "checked": chain.checked, "reason": "checkpoint event is missing"}
+    if event.hash != checkpoint.hash:
+        return {"valid": False, "checked": chain.checked, "reason": "checkpoint hash mismatch"}
+    return {"valid": True, "checked": chain.checked, "reason": None}

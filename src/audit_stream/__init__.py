@@ -1,5 +1,5 @@
 """
-audit-stream — local, in-memory governance event-stream prototype.
+audit-stream — local governance event-stream prototype with optional SQLite.
 
 The event envelope admits kinds planned for portfolio producers:
 
@@ -22,8 +22,9 @@ Local chain consistency:
 
     Each event carries `prev_hash` = canonical hash of the previous event,
     and `hash` = canonical hash of itself. Verifiers walk the retained chain.
-    This does not prove durability, completeness, or integrity across restart
-    without a separately trusted checkpoint. Event routes require a token.
+    SQLite mode preserves the retained chain across restart, but it does not
+    prove completeness or an independently trusted history. Event routes
+    require a shared bearer token.
 """
 
 from __future__ import annotations

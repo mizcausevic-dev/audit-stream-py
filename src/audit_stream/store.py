@@ -125,46 +125,60 @@ class AuditStore:
         async with self._lock:
             events = list(self._events)
 
-        expected_prev = GENESIS_HASH
-        for i, e in enumerate(events, start=1):
-            if e.event_id != i:
-                return ChainVerificationResult(
-                    valid=False,
-                    checked=i - 1,
-                    first_break_at=i,
-                    reason=f"event_id should be {i}, got {e.event_id}",
-                )
-            if e.prev_hash != expected_prev:
-                return ChainVerificationResult(
-                    valid=False,
-                    checked=i - 1,
-                    first_break_at=i,
-                    reason=f"prev_hash mismatch at event #{i}",
-                )
-            body = {
-                "event_id": e.event_id,
-                "timestamp": e.timestamp,
-                "kind": e.kind,
-                "source": e.source,
-                "payload": e.payload,
-                "prev_hash": e.prev_hash,
-            }
-            recomputed = _canonical_hash(body)
-            if recomputed != e.hash:
-                return ChainVerificationResult(
-                    valid=False,
-                    checked=i - 1,
-                    first_break_at=i,
-                    reason=f"hash mismatch at event #{i}",
-                )
-            expected_prev = e.hash
+        return verify_events(events)
 
-        return ChainVerificationResult(valid=True, checked=len(events), first_break_at=None, reason=None)
+
+def verify_events(events: list[GovernanceEvent]) -> ChainVerificationResult:
+    """Verify a complete ordered snapshot of the chain, including event IDs."""
+
+    expected_prev = GENESIS_HASH
+    for i, e in enumerate(events, start=1):
+        if e.event_id != i:
+            return ChainVerificationResult(
+                valid=False,
+                checked=i - 1,
+                first_break_at=i,
+                reason=f"event_id should be {i}, got {e.event_id}",
+            )
+        if e.prev_hash != expected_prev:
+            return ChainVerificationResult(
+                valid=False,
+                checked=i - 1,
+                first_break_at=i,
+                reason=f"prev_hash mismatch at event #{i}",
+            )
+        body = {
+            "event_id": e.event_id,
+            "timestamp": e.timestamp,
+            "kind": e.kind,
+            "source": e.source,
+            "payload": e.payload,
+            "prev_hash": e.prev_hash,
+        }
+        try:
+            recomputed = _canonical_hash(body)
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return ChainVerificationResult(
+                valid=False,
+                checked=i - 1,
+                first_break_at=i,
+                reason=f"non-finite or invalid JSON at event #{i}",
+            )
+        if recomputed != e.hash:
+            return ChainVerificationResult(
+                valid=False,
+                checked=i - 1,
+                first_break_at=i,
+                reason=f"hash mismatch at event #{i}",
+            )
+        expected_prev = e.hash
+
+    return ChainVerificationResult(valid=True, checked=len(events), first_break_at=None, reason=None)
 
 
 def _canonical_hash(body: dict[str, Any]) -> str:
     """SHA-256 over canonical JSON (sorted keys, no whitespace)."""
-    canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
 
