@@ -97,6 +97,11 @@ class TestAccessBoundary:
     def test_wrong_token_rejected(self, client: TestClient) -> None:
         assert client.get("/stats", headers={"Authorization": "Bearer wrong"}).status_code == 401
 
+    def test_wrong_token_cannot_append(self, client: TestClient) -> None:
+        response = client.post("/events", json=_event(), headers={"Authorization": "Bearer wrong"})
+        assert response.status_code == 401
+        assert client.get("/stats").json()["count"] == 0
+
     def test_unconfigured_service_fails_closed(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
