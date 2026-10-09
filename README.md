@@ -87,10 +87,12 @@ The HTTP 201 event body is an **accepted receipt**: it identifies an event appen
 | `incident-correlation-rs` | `incident_filed`, `remediation_planned` |
 | `hash-attestation-rs` | `attestation_verified`, `attestation_tampered` |
 | `feature-flag-rs` / `request-shadow-rs` | `flag_swapped`, `shadow_divergence_recorded` |
-| `mcp-permission-broker` | `tool_invocation_allowed`, `tool_invocation_denied`, `tool_invocation_required_approval` |
+| MCP runtime gate | `tool_invocation_allowed`, `tool_invocation_denied`, `tool_invocation_required_approval`, `tool_invocation_completed`, `tool_invocation_failed` |
 | extension | `other` |
 
 Adding kinds is a Literal-only change; producers and verifiers stay backwards-compatible if you keep the canonical-hash construction stable.
+
+For a gated MCP call, the host should use one opaque correlation ID across its decision and outcome events. A minimal pre-dispatch `tool_invocation_allowed` payload is `{correlation_id, tool_name, client_id, gate_config_version}` with `client_id` an opaque, non-personal identifier from a verified host credential. A minimal `tool_invocation_completed` or `tool_invocation_failed` payload is `{correlation_id, tool_name, decision_event_id, decision_hash, status}`; `status` is a bounded generic code. Omit raw arguments, results, tokens, buyer or tenant identities, and personal data. The host must verify the 201 receipt's source, kind, correlation, tool, event ID, and hash and require acceptance before invoking the handler. A 201 receipt proves only that this sink committed that event; the sink does not validate causal links or payload facts. The outcome write occurs after the handler and cannot undo its effects if it fails. For an authenticated denial, the host can attempt `tool_invocation_denied` before replying, but a sink outage leaves that denied attempt unrecorded. Pre-authentication noise is intentionally outside the required event path. Limit an early pilot to nonnetwork, nonmutating tools and reconcile each admitted call against an outcome event before claiming complete execution records.
 
 ---
 

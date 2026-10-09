@@ -105,7 +105,7 @@ data: {…full GovernanceEvent JSON…}
 | `incident-correlation-rs` | `incident_filed`, `remediation_planned` |
 | `hash-attestation-rs` | `attestation_verified`, `attestation_tampered` |
 | `feature-flag-rs` / `request-shadow-rs` | `flag_swapped`, `shadow_divergence_recorded` |
-| `mcp-permission-broker` | `tool_invocation_allowed`, `tool_invocation_denied`, `tool_invocation_required_approval` |
+| MCP runtime gate | `tool_invocation_allowed`, `tool_invocation_denied`, `tool_invocation_required_approval`, `tool_invocation_completed`, `tool_invocation_failed` |
 | — | `other` |
 
 **Adding a kind:** update the `Literal` union in `models.py`. No store or router changes needed.

@@ -16,6 +16,7 @@ from audit_stream.app import app
 TEST_TOKEN = "synthetic-test-token-0123456789abcdef"
 POLICY_TOKEN = "synthetic-policy-token-0123456789abcdef"
 REGISTRY_TOKEN = "synthetic-registry-token-0123456789abcdef"
+MCP_TOKEN = "synthetic-mcp-token-0123456789abcdef"
 READER_TOKEN = "synthetic-reader-token-0123456789abcdef"
 
 
@@ -324,7 +325,13 @@ class TestScopedBoundary:
         monkeypatch.setenv("AUDIT_STREAM_READER_TOKEN", READER_TOKEN)
         monkeypatch.setenv(
             "AUDIT_STREAM_PRODUCER_TOKENS",
-            json.dumps({"policy-as-code-engine": POLICY_TOKEN, "data-contract-registry": REGISTRY_TOKEN}),
+            json.dumps(
+                {
+                    "policy-as-code-engine": POLICY_TOKEN,
+                    "data-contract-registry": REGISTRY_TOKEN,
+                    "mcp-kinetic-gain": MCP_TOKEN,
+                }
+            ),
         )
         monkeypatch.setenv("AUDIT_STREAM_DB_PATH", str(tmp_path / "scoped.sqlite3"))
         with TestClient(app) as client:
@@ -354,6 +361,61 @@ class TestScopedBoundary:
         assert reader_stream.json()["detail"] == "SSE streaming is unavailable in scoped mode"
         assert scoped.post("/events", json=_event(), headers=reader).status_code == 401
         assert scoped.get("/stats", headers=reader).json()["count"] == 1
+
+    @pytest.mark.parametrize("outcome_kind", ["tool_invocation_completed", "tool_invocation_failed"])
+    def test_mcp_decision_and_outcome_events_are_source_bound_and_chained(
+        self, scoped: TestClient, outcome_kind: str
+    ) -> None:
+        producer = {"Authorization": f"Bearer {MCP_TOKEN}"}
+        reader = {"Authorization": f"Bearer {READER_TOKEN}"}
+        correlation_id = "484b3700-301a-4d53-a12d-54c29a35a36d"
+        decision = scoped.post(
+            "/events",
+            json=_event(
+                source="mcp-kinetic-gain",
+                kind="tool_invocation_allowed",
+                payload={
+                    "correlation_id": correlation_id,
+                    "tool_name": "demo.read",
+                    "client_id": "synthetic-client",
+                    "gate_config_version": 1,
+                },
+            ),
+            headers=producer,
+        )
+        assert decision.status_code == 201
+        receipt = decision.json()
+        assert receipt["payload"]["gate_config_version"] == 1
+        outcome = scoped.post(
+            "/events",
+            json=_event(
+                source="mcp-kinetic-gain",
+                kind=outcome_kind,
+                payload={
+                    "correlation_id": correlation_id,
+                    "tool_name": "demo.read",
+                    "decision_event_id": receipt["event_id"],
+                    "decision_hash": receipt["hash"],
+                    "status": "ok" if outcome_kind.endswith("completed") else "handler_error",
+                },
+            ),
+            headers=producer,
+        )
+        assert outcome.status_code == 201
+        outcome_receipt = outcome.json()
+        assert outcome_receipt["event_id"] == receipt["event_id"] + 1
+        assert outcome_receipt["prev_hash"] == receipt["hash"]
+        assert scoped.get("/verify", headers=reader).json()["valid"] is True
+        assert scoped.get("/events/2", headers=reader).json() == outcome_receipt
+        assert scoped.get(f"/events?kind={outcome_kind}", headers=reader).json() == [outcome_receipt]
+        assert (
+            scoped.post(
+                "/events",
+                json=_event(source="policy-as-code-engine", kind=outcome_kind),
+                headers=producer,
+            ).status_code
+            == 403
+        )
 
     def test_source_spoof_and_timestamp_rejected_without_append(self, scoped: TestClient) -> None:
         producer = {"Authorization": f"Bearer {POLICY_TOKEN}"}
