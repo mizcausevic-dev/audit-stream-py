@@ -45,6 +45,7 @@ dev = [
 
 [project.scripts]
 audit-stream = "audit_stream.__main__:main"
+audit-stream-verify-restore = "audit_stream.restore_check:main"
 
 [project.urls]
 Homepage      = "https://github.com/mizcausevic-dev/audit-stream-py"

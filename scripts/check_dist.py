@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import tarfile
 import tomllib
 import zipfile
@@ -33,6 +34,7 @@ def main() -> None:
             "app.py",
             "boundary.py",
             "models.py",
+            "restore_check.py",
             "sqlite_store.py",
             "store.py",
         )
@@ -51,6 +53,18 @@ def main() -> None:
         metadata = Parser().parsestr(wheel.read(f"{info}/METADATA").decode("utf-8"))
         if metadata["Name"] != project["name"] or metadata["Version"] != version:
             raise SystemExit("wheel package name/version does not match pyproject.toml")
+        entry_points = configparser.ConfigParser(interpolation=None)
+        entry_points.optionxform = str
+        entry_points.read_string(wheel.read(f"{info}/entry_points.txt").decode("utf-8"))
+        expected_scripts = {
+            "audit-stream": "audit_stream.__main__:main",
+            "audit-stream-verify-restore": "audit_stream.restore_check:main",
+        }
+        if (
+            entry_points.sections() != ["console_scripts"]
+            or dict(entry_points.items("console_scripts")) != expected_scripts
+        ):
+            raise SystemExit("wheel console entry points do not match the expected scripts")
 
     root = f"audit_stream-{version}/"
     source_files = {root + f"src/{name}" for name in package_files}
@@ -60,6 +74,7 @@ def main() -> None:
             "__init__.py",
             "test_app.py",
             "test_main.py",
+            "test_restore_check.py",
             "test_sqlite_store.py",
             "test_store.py",
         )

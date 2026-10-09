@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -128,10 +128,11 @@ class AuditStore:
         return verify_events(events)
 
 
-def verify_events(events: list[GovernanceEvent]) -> ChainVerificationResult:
+def verify_events(events: Iterable[GovernanceEvent]) -> ChainVerificationResult:
     """Verify a complete ordered snapshot of the chain, including event IDs."""
 
     expected_prev = GENESIS_HASH
+    checked = 0
     for i, e in enumerate(events, start=1):
         if e.event_id != i:
             return ChainVerificationResult(
@@ -172,8 +173,9 @@ def verify_events(events: list[GovernanceEvent]) -> ChainVerificationResult:
                 reason=f"hash mismatch at event #{i}",
             )
         expected_prev = e.hash
+        checked = i
 
-    return ChainVerificationResult(valid=True, checked=len(events), first_break_at=None, reason=None)
+    return ChainVerificationResult(valid=True, checked=checked, first_break_at=None, reason=None)
 
 
 def _canonical_hash(body: dict[str, Any]) -> str:
