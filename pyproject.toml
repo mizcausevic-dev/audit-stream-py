@@ -1,11 +1,11 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "audit-stream"
-version = "0.1.0"
-description = "Append-only governance event stream. Hash-chained for tamper-evidence, SSE for live tailing, REST for queries. The cross-cutting telemetry layer for the Kinetic Gain portfolio."
+version = "0.2.0"
+description = "Local governance event-stream prototype with optional SQLite persistence, hash-chained events, SSE, and REST queries."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -45,6 +45,7 @@ dev = [
 
 [project.scripts]
 audit-stream = "audit_stream.__main__:main"
+audit-stream-verify-restore = "audit_stream.restore_check:main"
 
 [project.urls]
 Homepage      = "https://github.com/mizcausevic-dev/audit-stream-py"
@@ -54,6 +55,9 @@ Issues        = "https://github.com/mizcausevic-dev/audit-stream-py/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/audit_stream"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src/audit_stream", "tests", "examples", "scripts", "README.md", "LICENSE", "pyproject.toml", ".gitignore"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

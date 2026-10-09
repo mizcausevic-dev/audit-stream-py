@@ -118,6 +118,17 @@ class TestChainVerification:
         # Now event #2 is what used to be #3 — its event_id is 3, mismatch at #2.
         assert result.first_break_at == 2
 
+    @pytest.mark.asyncio
+    async def test_whole_chain_replacement_requires_external_anchor_to_detect(self) -> None:
+        store = AuditStore()
+        original = await store.append(_req(kind="request_denied"))
+        store._events.clear()
+        replacement = await store.append(_req(kind="request_allowed"))
+        assert replacement.hash != original.hash
+        result = await store.verify_chain()
+        assert result.valid is True
+        assert result.checked == 1
+
 
 class TestSubscribe:
     @pytest.mark.asyncio
