@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -54,6 +54,9 @@ Issues        = "https://github.com/mizcausevic-dev/audit-stream-py/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/audit_stream"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src/audit_stream", "tests", "examples", "scripts", "README.md", "LICENSE", "pyproject.toml", ".gitignore"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

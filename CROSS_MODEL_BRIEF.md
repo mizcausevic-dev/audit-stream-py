@@ -2,7 +2,7 @@
 
 > **For AI agents, coding assistants, and model handoffs.**
 > Read this before touching any file in this repo.
-> Keep it under 400 lines. Owner: @mizcausevic-dev · Updated: 2026-10-08
+> Keep it under 400 lines. Owner: @mizcausevic-dev · Updated: 2026-10-09
 
 ---
 
@@ -10,11 +10,11 @@
 
 `audit-stream` is a **local prototype** of a governance event spine for the Kinetic Gain portfolio.
 
-- Process-local event list with SHA-256 hash chaining; no durability or external integrity anchor
-- **Server-Sent Events** (`GET /stream`) for live dashboard tailing
-- **REST** (`POST /events`, `GET /events`, `GET /verify`, `GET /stats`) for writes and queries
-- In-memory store (single process); restart discards all events
-- Event routes require `AUDIT_STREAM_TOKEN`; the CLI defaults to `127.0.0.1:8093`
+- SHA-256 hash chain with in-memory legacy mode or opt-in SQLite WAL durability
+- **Server-Sent Events** (`GET /stream`) only in explicit legacy prototype mode
+- **REST** writes, queries, verification, and external checkpoint export/compare
+- Scoped mode requires SQLite and separates source-bound producer tokens from the reader token
+- Legacy shared-token mode requires explicit `AUDIT_STREAM_AUTH_MODE=legacy`; the CLI defaults to `127.0.0.1:8093`
 
 ---
 
@@ -25,9 +25,11 @@ audit-stream-py/
 ├── src/audit_stream/
 │   ├── __init__.py       # Package init + version
 │   ├── __main__.py       # CLI entrypoint → uvicorn
-│   ├── app.py            # FastAPI router, all 8 endpoints
+│   ├── app.py            # FastAPI routes and source binding
+│   ├── boundary.py       # Preparse body cap, auth config, local rate control
 │   ├── models.py         # Pydantic models: PublishRequest, GovernanceEvent
-│   └── store.py          # AuditStore: append, query, verify, SSE broadcast
+│   ├── sqlite_store.py   # Transactional local SQLite chain
+│   └── store.py          # In-memory chain, shared verify logic, SSE broadcast
 ├── tests/                # pytest suite (unit + integration)
 ├── examples/             # curl / httpx usage snippets
 ├── pyproject.toml        # hatchling build, ruff, mypy, pytest config
@@ -45,7 +47,7 @@ Every stored event carries:
 - `prev_hash` — the `hash` of the immediately preceding event (64 zero-chars for event #1)
 - `hash` — SHA-256 over canonical JSON of all other fields (sorted keys, no whitespace)
 
-`GET /verify` rewalks the chain still present in one process and returns `{ valid, checked, first_break_at, reason }`. A restarted, empty store returns `valid: true` with `checked: 0`; it cannot prove completeness without a trusted external checkpoint.
+`GET /verify` rewalks the current chain and returns `{ valid, checked, first_break_at, reason }`. In-memory legacy mode loses its chain on restart. SQLite mode verifies the stored chain on reopen, but a validly truncated or recomputed chain needs a checkpoint kept by an independent custodian. The service does not provide that custody.
 
 ### Event Envelope
 
@@ -61,11 +63,11 @@ Every stored event carries:
 }
 ```
 
-`event_id` is monotonic within one process; assigned by `AuditStore`, never by the producer.
+`event_id` is assigned by the store. A scoped-mode HTTP 201 is an accepted receipt after SQLite commit; it is not proof that every producer action was captured. Scoped mode binds `source` to the producer token and stamps the sink clock. Buyer, tenant, caller, and condition fields in `payload` remain producer assertions.
 
 ### SSE Broadcast
 
-`store.py` holds an `asyncio.Queue` per subscriber. `POST /events` fans out to all live queues. Each SSE frame:
+In legacy mode, `store.py` holds an `asyncio.Queue` per subscriber. `POST /events` fans out to live queues. Each SSE frame:
 
 ```
 event: watch_drifted
@@ -81,12 +83,14 @@ data: {…full GovernanceEvent JSON…}
 |--------|------|-------|
 | GET | `/` | Public service info |
 | GET | `/healthz` | Public liveness probe without event data |
-| POST | `/events` | Bearer token required; appends event and returns `event_id`, `prev_hash`, `hash` |
-| GET | `/events?kind=&source=&limit=` | Bearer token required; filtered query, most-recent N |
-| GET | `/events/{id}` | Bearer token required; single event by process-local ID |
-| GET | `/stream` | Bearer token required; SSE live tail (subscribes after connection time) |
-| GET | `/verify` | Bearer token required; retained-chain consistency walk |
-| GET | `/stats` | Bearer token required; `{ count, last_event_id, latest_hash }` |
+| POST | `/events` | Source-bound producer bearer; 80 KiB preparse cap, per-process rate bound, 201 receipt |
+| GET | `/events?kind=&source=&limit=` | Reader bearer; filtered query, most-recent N |
+| GET | `/events/{id}` | Reader bearer; single event by ID |
+| GET | `/stream` | Legacy shared bearer only; scoped mode returns 501 until SSE sessions can revalidate revocation |
+| GET | `/verify` | Reader bearer; retained-chain consistency walk |
+| GET | `/stats` | Reader bearer; `{ count, last_event_id, latest_hash }` |
+| GET | `/checkpoint` | Reader bearer; export nonempty chain head for outside custody |
+| POST | `/verify/checkpoint` | Reader bearer; compare supplied checkpoint with current chain |
 
 ---
 
@@ -112,12 +116,12 @@ data: {…full GovernanceEvent JSON…}
 
 | Constraint | Current State | Risk |
 |------------|--------------|------|
-| Storage | In-memory only | Process restart = data loss; no persistence yet |
+| Storage | Scoped mode requires SQLite; legacy may use RAM | Local filesystem owner can replace chain and backups |
 | Concurrency | `asyncio` single-process | No horizontal scaling; single uvicorn worker |
-| Auth | One shared bearer token required; no scoped identity | No tenant boundary or producer attribution; sibling producers do not yet send the header |
-| Ingress | No body-size or rate limit | FastAPI may parse a large unauthenticated body before the route dependency rejects it |
-| SSE reconnect | Not implemented | Clients miss events during disconnect |
-| Chain integrity | Hashes over current RAM events | Restart and whole-chain replacement can appear valid |
+| Auth | Separate source-bound producer tokens and reader token in scoped mode | No tenant isolation, managed identity, or verified payload facts |
+| Ingress | Preparse 80 KiB wire cap and 120/min per-source local rate default | No network-wide rate limit or private hosted boundary |
+| SSE reconnect/revocation | Legacy stream has neither | Scoped mode disables streaming; polling is available |
+| Chain integrity | SQLite reopen check and checkpoint comparison | No independently held production checkpoint; recomputed replacement can appear valid |
 | Schema evolution | `Literal` kinds | Adding kinds is safe; renaming breaks `verify` for old events |
 
 ---
@@ -136,7 +140,8 @@ mypy src
 pytest -v
 
 # run
-# Configure AUDIT_STREAM_TOKEN from a local secret source first.
+# Configure AUDIT_STREAM_AUTH_MODE=legacy and AUDIT_STREAM_TOKEN from a
+# secret source for a local prototype, or use scoped mode with SQLite.
 audit-stream   # → http://127.0.0.1:8093
 ```
 
@@ -148,16 +153,16 @@ CI matrix: Python **3.11 / 3.12 / 3.13**.
 
 - ❌ Don't add a `DELETE /events/{id}` — breaks the hash chain contract
 - ❌ Don't change the canonical hash construction (sorted-key JSON, no whitespace) without a migration strategy — breaks `verify` for all existing events
-- ❌ Don't expose event routes without the bearer check; `healthz` contains no event data
-- ❌ Don't store mutable state outside `AuditStore` — SSE subscribers are tracked there
+- ❌ Don't expose event routes without the request boundary; `healthz` contains no event data
+- ❌ Don't store the event chain outside `AuditStore`; the local ingress limiter holds only rate-window state
 - ❌ Don't rename `GovernanceEvent` fields referenced in hash computation without a migration plan
 
 ---
 
 ## 9. Near-Term Roadmap (untracked)
 
-- [ ] Durable persistence backend behind an `AuditStore` protocol interface
-- [ ] Scoped producer and reader identities; the current shared-token guard is only a prototype
+- [ ] Independently held checkpoint with tested custody, retention, and restore procedure
+- [ ] Managed producer identity, revocation, tenant isolation, and hosted network controls
 - [ ] SSE `Last-Event-ID` replay on reconnect
 - [ ] Prometheus `/metrics` endpoint
 - [ ] Docker image + Compose example with portfolio siblings
@@ -166,7 +171,7 @@ CI matrix: Python **3.11 / 3.12 / 3.13**.
 
 ## 10. Portfolio Siblings
 
-These repos are proposed producers. Their audit URL conventions and bearer authentication have not been integrated; no cross-repo deployment is verified:
+Policy Engine and Data Contract Registry have merged optional best-effort emitters with compatible bearer headers. Procurement's candidate remains an open PR. Other repos below are proposed producers. No cross-repo hosted deployment or completeness is verified:
 
 - [procurement-decision-api](https://github.com/mizcausevic-dev/procurement-decision-api)
 - [policy-as-code-engine](https://github.com/mizcausevic-dev/policy-as-code-engine)

@@ -23,8 +23,9 @@ Local chain consistency:
     Each event carries `prev_hash` = canonical hash of the previous event,
     and `hash` = canonical hash of itself. Verifiers walk the retained chain.
     SQLite mode preserves the retained chain across restart, but it does not
-    prove completeness or an independently trusted history. Event routes
-    require a shared bearer token.
+    prove completeness or an independently trusted history. Scoped mode
+    requires source-bound producer tokens, a separate reader token, and SQLite;
+    explicit legacy mode retains the prototype shared-token behavior.
 """
 
 from __future__ import annotations

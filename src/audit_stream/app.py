@@ -17,20 +17,19 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from secrets import compare_digest
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from . import __version__
+from .boundary import LocalRateLimiter, Principal, RequestBoundary, access_config, authorize
 from .models import Checkpoint, EventKind, GovernanceEvent, PublishRequest
 from .sqlite_store import SqliteAuditStore
 from .store import AuditStore
@@ -39,7 +38,10 @@ from .store import AuditStore
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     db_path = os.environ.get("AUDIT_STREAM_DB_PATH", "").strip()
+    if os.environ.get("AUDIT_STREAM_AUTH_MODE", "").strip() == "scoped" and not db_path:
+        raise RuntimeError("scoped audit access requires AUDIT_STREAM_DB_PATH")
     app.state.store = SqliteAuditStore(Path(db_path)) if db_path else AuditStore()
+    _limiter.reset()
     try:
         yield
     finally:
@@ -49,12 +51,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="audit-stream",
     version=__version__,
-    description=(
-        "Append-only governance event stream for the Kinetic Gain portfolio. "
-        "Hash-chained for tamper-evidence; SSE for live tailing."
-    ),
+    description="Hash-chained local governance event stream for the Kinetic Gain portfolio.",
     lifespan=_lifespan,
 )
+_limiter = LocalRateLimiter()
+app.add_middleware(RequestBoundary, limiter=_limiter)
 
 
 @app.exception_handler(RequestValidationError)
@@ -71,24 +72,15 @@ def _store() -> AuditStore:
     return cast(AuditStore, app.state.store)
 
 
-def _require_token(authorization: str | None = Header(default=None)) -> None:
-    """Keep event data closed until an operator configures a shared token."""
-    expected = os.environ.get("AUDIT_STREAM_TOKEN", "")
-    if re.fullmatch(r"[!-~]{32,}", expected) is None:
-        raise HTTPException(status_code=503, detail="audit access is not configured")
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="bearer token required",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    provided = authorization[len("Bearer ") :]
-    if not provided.isascii() or not compare_digest(provided, expected):
-        raise HTTPException(
-            status_code=401,
-            detail="invalid bearer token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+def _require_reader(request: Request) -> None:
+    authorize(request.scope, "reader")
+
+
+def _require_producer(request: Request) -> Principal:
+    principal = getattr(request.state, "audit_principal", None)
+    if not isinstance(principal, Principal) or principal.role != "producer":
+        raise HTTPException(status_code=401, detail="producer token required")
+    return principal
 
 
 @app.get("/", tags=["meta"])
@@ -97,7 +89,8 @@ async def root() -> dict[str, Any]:
         "name": "audit-stream",
         "version": __version__,
         "description": (
-            "Append-only governance events for the Kinetic Gain portfolio. Hash-chained, SSE-tailed."
+            "Hash-chained local governance events for the Kinetic Gain portfolio. "
+            "Scoped mode has no SSE stream."
         ),
         "endpoints": {
             "GET  /": "this page",
@@ -105,7 +98,7 @@ async def root() -> dict[str, Any]:
             "POST /events": "append one event",
             "GET  /events": "query events (kind / source / limit)",
             "GET  /events/{id}": "fetch one event",
-            "GET  /stream": "live tail via Server-Sent Events",
+            "GET  /stream": "legacy prototype live tail; unavailable in scoped mode",
             "GET  /verify": "verify the hash chain end-to-end",
             "GET  /stats": "summary stats",
             "GET  /checkpoint": "export current chain head for external anchoring",
@@ -119,12 +112,18 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/events", tags=["producer"], status_code=201, dependencies=[Depends(_require_token)])
-async def append_event(req: PublishRequest) -> GovernanceEvent:
+@app.post("/events", tags=["producer"], status_code=201)
+async def append_event(
+    req: PublishRequest, principal: Annotated[Principal, Depends(_require_producer)]
+) -> GovernanceEvent:
+    if principal.source is not None and req.source != principal.source:
+        raise HTTPException(status_code=403, detail="source is not authorized")
+    if principal.source is not None and req.timestamp is not None:
+        raise HTTPException(status_code=422, detail="producer timestamp is not accepted")
     return await _store().append(req)
 
 
-@app.get("/events", tags=["consumer"], dependencies=[Depends(_require_token)])
+@app.get("/events", tags=["consumer"], dependencies=[Depends(_require_reader)])
 async def query_events(
     kind: EventKind | None = None,
     source: str | None = None,
@@ -141,7 +140,7 @@ async def query_events(
     return events[-limit:]
 
 
-@app.get("/events/{event_id}", tags=["consumer"], dependencies=[Depends(_require_token)])
+@app.get("/events/{event_id}", tags=["consumer"], dependencies=[Depends(_require_reader)])
 async def get_event(event_id: int) -> GovernanceEvent:
     event = await _store().get(event_id)
     if event is None:
@@ -149,9 +148,15 @@ async def get_event(event_id: int) -> GovernanceEvent:
     return event
 
 
-@app.get("/stream", tags=["consumer"], dependencies=[Depends(_require_token)])
+@app.get("/stream", tags=["consumer"], dependencies=[Depends(_require_reader)])
 async def stream_events() -> EventSourceResponse:
     """Live tail of every event after the moment of subscription."""
+
+    config = access_config()
+    if config is None:
+        raise HTTPException(status_code=503, detail="audit access is not configured")
+    if config.mode == "scoped":
+        raise HTTPException(status_code=501, detail="SSE streaming is unavailable in scoped mode")
 
     async def generator() -> AsyncIterator[dict[str, Any]]:
         async for event in _store().subscribe():
@@ -164,7 +169,7 @@ async def stream_events() -> EventSourceResponse:
     return EventSourceResponse(generator())
 
 
-@app.get("/verify", tags=["consumer"], dependencies=[Depends(_require_token)])
+@app.get("/verify", tags=["consumer"], dependencies=[Depends(_require_reader)])
 async def verify_chain() -> dict[str, Any]:
     result = await _store().verify_chain()
     return {
@@ -175,7 +180,7 @@ async def verify_chain() -> dict[str, Any]:
     }
 
 
-@app.get("/stats", tags=["consumer"], dependencies=[Depends(_require_token)])
+@app.get("/stats", tags=["consumer"], dependencies=[Depends(_require_reader)])
 async def stats() -> dict[str, Any]:
     latest = await _store().latest()
     return {
@@ -185,7 +190,7 @@ async def stats() -> dict[str, Any]:
     }
 
 
-@app.get("/checkpoint", tags=["consumer"], dependencies=[Depends(_require_token)])
+@app.get("/checkpoint", tags=["consumer"], dependencies=[Depends(_require_reader)])
 async def export_checkpoint() -> Checkpoint:
     """Return a candidate anchor; the operator must store it independently."""
     latest = await _store().latest()
@@ -194,7 +199,7 @@ async def export_checkpoint() -> Checkpoint:
     return Checkpoint(event_id=latest.event_id, hash=latest.hash)
 
 
-@app.post("/verify/checkpoint", tags=["consumer"], dependencies=[Depends(_require_token)])
+@app.post("/verify/checkpoint", tags=["consumer"], dependencies=[Depends(_require_reader)])
 async def verify_checkpoint(checkpoint: Checkpoint) -> dict[str, Any]:
     """Compare the current chain with an operator-supplied trusted anchor."""
     chain = await _store().verify_chain()

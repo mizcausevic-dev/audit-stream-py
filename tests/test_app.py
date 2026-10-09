@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,17 @@ from fastapi.testclient import TestClient
 from audit_stream.app import app
 
 TEST_TOKEN = "synthetic-test-token-0123456789abcdef"
+POLICY_TOKEN = "synthetic-policy-token-0123456789abcdef"
+REGISTRY_TOKEN = "synthetic-registry-token-0123456789abcdef"
+READER_TOKEN = "synthetic-reader-token-0123456789abcdef"
+
+
+@pytest.fixture(autouse=True)
+def _legacy_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUDIT_STREAM_AUTH_MODE", "legacy")
+    monkeypatch.delenv("AUDIT_STREAM_READER_TOKEN", raising=False)
+    monkeypatch.delenv("AUDIT_STREAM_PRODUCER_TOKENS", raising=False)
+    monkeypatch.delenv("AUDIT_STREAM_MAX_EVENTS_PER_MINUTE", raising=False)
 
 
 @pytest.fixture
@@ -152,6 +164,13 @@ class TestAccessBoundary:
         assert client.post("/events", json=_event()).status_code == 503
         assert client.get("/events").status_code == 503
         assert client.get("/healthz").json() == {"status": "ok"}
+
+    def test_legacy_token_requires_explicit_mode_after_upgrade(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("AUDIT_STREAM_AUTH_MODE")
+        assert client.post("/events", json=_event()).status_code == 503
+        assert client.get("/stats").status_code == 503
 
     @pytest.mark.parametrize("configured", ["short", "has spaces" * 4, "é" * 32])
     def test_weak_or_invalid_config_fails_closed(
@@ -295,3 +314,207 @@ class TestVerifyAndStats:
         result = client.post("/verify/checkpoint", json=missing).json()
         assert result["valid"] is False
         assert result["reason"] == "checkpoint event is missing"
+
+
+class TestScopedBoundary:
+    @pytest.fixture
+    def scoped(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[TestClient]:
+        monkeypatch.setenv("AUDIT_STREAM_AUTH_MODE", "scoped")
+        monkeypatch.delenv("AUDIT_STREAM_TOKEN", raising=False)
+        monkeypatch.setenv("AUDIT_STREAM_READER_TOKEN", READER_TOKEN)
+        monkeypatch.setenv(
+            "AUDIT_STREAM_PRODUCER_TOKENS",
+            json.dumps({"policy-as-code-engine": POLICY_TOKEN, "data-contract-registry": REGISTRY_TOKEN}),
+        )
+        monkeypatch.setenv("AUDIT_STREAM_DB_PATH", str(tmp_path / "scoped.sqlite3"))
+        with TestClient(app) as client:
+            yield client
+
+    def test_scoped_mode_requires_durable_store(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_AUTH_MODE", "scoped")
+        monkeypatch.delenv("AUDIT_STREAM_DB_PATH", raising=False)
+        with pytest.raises(RuntimeError, match="requires AUDIT_STREAM_DB_PATH"):
+            with TestClient(app):
+                pass
+
+    def test_source_bound_write_receipt_and_read_separation(self, scoped: TestClient) -> None:
+        producer = {"Authorization": f"Bearer {POLICY_TOKEN}"}
+        reader = {"Authorization": f"Bearer {READER_TOKEN}"}
+        accepted = scoped.post("/events", json=_event(), headers=producer)
+        assert accepted.status_code == 201
+        receipt = accepted.json()
+        assert receipt["event_id"] == 1
+        assert receipt["source"] == "policy-as-code-engine"
+        assert len(receipt["hash"]) == 64
+        assert scoped.get("/events/1", headers=reader).json() == receipt
+        assert scoped.get("/stats", headers=producer).status_code == 401
+        assert scoped.get("/stream", headers=producer).status_code == 401
+        reader_stream = scoped.get("/stream", headers=reader)
+        assert reader_stream.status_code == 501
+        assert reader_stream.json()["detail"] == "SSE streaming is unavailable in scoped mode"
+        assert scoped.post("/events", json=_event(), headers=reader).status_code == 401
+        assert scoped.get("/stats", headers=reader).json()["count"] == 1
+
+    def test_source_spoof_and_timestamp_rejected_without_append(self, scoped: TestClient) -> None:
+        producer = {"Authorization": f"Bearer {POLICY_TOKEN}"}
+        reader = {"Authorization": f"Bearer {READER_TOKEN}"}
+        assert (
+            scoped.post("/events", json=_event(source="data-contract-registry"), headers=producer).status_code
+            == 403
+        )
+        assert (
+            scoped.post(
+                "/events", json=_event(timestamp="2026-01-01T00:00:00Z"), headers=producer
+            ).status_code
+            == 422
+        )
+        assert scoped.get("/stats", headers=reader).json()["count"] == 0
+
+    def test_oversized_wire_body_rejected_before_parse(self, scoped: TestClient) -> None:
+        producer = {"Authorization": f"Bearer {POLICY_TOKEN}"}
+        reader = {"Authorization": f"Bearer {READER_TOKEN}"}
+        body = b"x" * (80 * 1024 + 1)
+        response = scoped.post(
+            "/events", content=body, headers={**producer, "Content-Type": "application/json"}
+        )
+        assert response.status_code == 413
+        chunks = (b"x" * 20_000 for _ in range(5))
+        response = scoped.post(
+            "/events", content=chunks, headers={**producer, "Content-Type": "application/json"}
+        )
+        assert response.status_code == 413
+        misleading = (b"x" * 20_000 for _ in range(5))
+        response = scoped.post(
+            "/events",
+            content=misleading,
+            headers={**producer, "Content-Type": "application/json", "Content-Length": "1"},
+        )
+        assert response.status_code == 413
+        assert scoped.get("/stats", headers=reader).json()["count"] == 0
+
+    def test_unauthorized_oversized_body_is_rejected_before_parse(self, scoped: TestClient) -> None:
+        response = scoped.post(
+            "/events",
+            content=b"x" * (80 * 1024 + 1),
+            headers={"Authorization": "Bearer wrong", "Content-Type": "application/json"},
+        )
+        assert response.status_code == 401
+
+    def test_checkpoint_body_is_bounded_before_parse(self, scoped: TestClient) -> None:
+        response = scoped.post(
+            "/verify/checkpoint",
+            content=b"x" * 1025,
+            headers={"Authorization": f"Bearer {READER_TOKEN}", "Content-Type": "application/json"},
+        )
+        assert response.status_code == 413
+
+    def test_duplicate_authorization_headers_are_rejected(self, scoped: TestClient) -> None:
+        response = scoped.post(
+            "/events",
+            json=_event(),
+            headers=[
+                ("Authorization", f"Bearer {POLICY_TOKEN}"),
+                ("Authorization", f"Bearer {POLICY_TOKEN}"),
+            ],
+        )
+        assert response.status_code == 401
+
+    def test_local_rate_limit_rejects_without_append(
+        self, scoped: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_MAX_EVENTS_PER_MINUTE", "2")
+        producer = {"Authorization": f"Bearer {POLICY_TOKEN}"}
+        reader = {"Authorization": f"Bearer {READER_TOKEN}"}
+        assert scoped.post("/events", json=_event(), headers=producer).status_code == 201
+        assert scoped.post("/events", json=_event(), headers=producer).status_code == 201
+        refused = scoped.post("/events", json=_event(), headers=producer)
+        assert refused.status_code == 429
+        assert refused.headers["retry-after"] == "60"
+        assert scoped.get("/stats", headers=reader).json()["count"] == 2
+
+    @pytest.mark.parametrize(
+        "bad_mapping",
+        [
+            "{}",
+            '{"policy-as-code-engine":"short"}',
+            json.dumps({"policy-as-code-engine": READER_TOKEN}),
+            json.dumps({"policy-as-code-engine": POLICY_TOKEN, "data-contract-registry": POLICY_TOKEN}),
+            '{"policy-as-code-engine":"'
+            + POLICY_TOKEN
+            + '","policy-as-code-engine":"'
+            + REGISTRY_TOKEN
+            + '"}',
+        ],
+    )
+    def test_invalid_scoped_config_fails_closed(
+        self, scoped: TestClient, monkeypatch: pytest.MonkeyPatch, bad_mapping: str
+    ) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_PRODUCER_TOKENS", bad_mapping)
+        assert (
+            scoped.post(
+                "/events", json=_event(), headers={"Authorization": f"Bearer {POLICY_TOKEN}"}
+            ).status_code
+            == 503
+        )
+        assert scoped.get("/stats", headers={"Authorization": f"Bearer {READER_TOKEN}"}).status_code == 503
+
+    def test_mixed_legacy_and_scoped_credentials_fail_closed(
+        self, scoped: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_TOKEN", TEST_TOKEN)
+        assert (
+            scoped.post(
+                "/events", json=_event(), headers={"Authorization": f"Bearer {POLICY_TOKEN}"}
+            ).status_code
+            == 503
+        )
+        assert scoped.get("/stats", headers={"Authorization": f"Bearer {READER_TOKEN}"}).status_code == 503
+
+    def test_external_checkpoint_copy_and_backup_restore_drill(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        service_dir = tmp_path / "service"
+        custody_dir = tmp_path / "synthetic-custody"
+        restore_dir = tmp_path / "restore"
+        for directory in (service_dir, custody_dir, restore_dir):
+            directory.mkdir()
+        db_path = service_dir / "events.sqlite3"
+        backup_path = restore_dir / "events.sqlite3"
+        checkpoint_path = custody_dir / "checkpoint.json"
+        monkeypatch.setenv("AUDIT_STREAM_AUTH_MODE", "scoped")
+        monkeypatch.delenv("AUDIT_STREAM_TOKEN", raising=False)
+        monkeypatch.setenv("AUDIT_STREAM_READER_TOKEN", READER_TOKEN)
+        monkeypatch.setenv(
+            "AUDIT_STREAM_PRODUCER_TOKENS", json.dumps({"policy-as-code-engine": POLICY_TOKEN})
+        )
+        monkeypatch.setenv("AUDIT_STREAM_DB_PATH", str(db_path))
+        producer = {"Authorization": f"Bearer {POLICY_TOKEN}"}
+        reader = {"Authorization": f"Bearer {READER_TOKEN}"}
+        with TestClient(app) as live:
+            accepted = live.post("/events", json=_event(), headers=producer)
+            assert accepted.status_code == 201
+            receipt = accepted.json()
+            assert live.get("/events/1", headers=reader).json() == receipt
+            checkpoint = live.get("/checkpoint", headers=reader).json()
+            assert checkpoint == {"event_id": receipt["event_id"], "hash": receipt["hash"]}
+            checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+            with sqlite3.connect(db_path) as source, sqlite3.connect(backup_path) as backup:
+                source.backup(backup)
+
+        monkeypatch.setenv("AUDIT_STREAM_DB_PATH", str(backup_path))
+        trusted_copy = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        with TestClient(app) as restored:
+            assert restored.get("/verify", headers=reader).json()["valid"] is True
+            assert (
+                restored.post("/verify/checkpoint", json=trusted_copy, headers=reader).json()["valid"] is True
+            )
+            assert restored.get("/events/1", headers=reader).json() == receipt
+
+        with sqlite3.connect(backup_path) as connection:
+            connection.execute("DROP TRIGGER events_no_delete")
+            connection.execute("DELETE FROM events")
+        with TestClient(app) as truncated:
+            assert truncated.get("/verify", headers=reader).json()["valid"] is True
+            verdict = truncated.post("/verify/checkpoint", json=trusted_copy, headers=reader).json()
+            assert verdict["valid"] is False
+            assert verdict["reason"] == "checkpoint event is missing"
